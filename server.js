@@ -99,44 +99,19 @@ app.get('/api/tunnel', async (req, res) => {
             try {
 
                 // =========================
-                // 1. GET TITLE FIRST
-                // =========================
-                const title = await new Promise((resolve) => {
-                    const p = spawn('/opt/venv/bin/yt-dlp', [
-                        '--print', '%(title)s',
-                        '--no-check-certificate',
-                        '--proxy', proxyUrl,
-                        target_url
-                    ]);
-
-                    let out = '';
-
-                    p.stdout.on('data', d => out += d.toString());
-
-                    p.on('close', () => {
-                        resolve(out.trim() || 'audio');
-                    });
-                });
-
-                // clean filename
-                const safeTitle = title.replace(/[^a-z0-9а-яё_\- ]/gi, '').slice(0, 80);
-
-                res.setHeader('Content-Type', 'audio/mpeg');
-                res.setHeader(
-                    'Content-Disposition',
-                    `attachment; filename="${safeTitle}.m4a"`
-                );
-
-                // =========================
-                // 2. STREAM AUDIO
+                // yt-dlp STREAM (spawn FIX)
                 // =========================
                 const yt = spawn('/opt/venv/bin/yt-dlp', [
-                    '-f', 'bestaudio',
+                    '-f', 'bestaudio[ext=m4a]/bestaudio',
                     '--no-check-certificate',
+                    '--add-header', 'User-Agent: Mozilla/5.0',
+                    '--add-header', 'Accept-Language: en-US,en',
                     '--proxy', proxyUrl,
                     '-o', '-',
                     target_url
                 ]);
+
+                res.setHeader('Content-Type', 'audio/m4a');
 
                 let started = false;
 
@@ -149,11 +124,32 @@ app.get('/api/tunnel', async (req, res) => {
                     console.log('yt-dlp:', d.toString());
                 });
 
+                yt.on('error', async (err) => {
+                    console.log('FAIL:', proxyAddress, err.message);
+
+                    if (pool) {
+                        try {
+                            await pool.query(
+                                'DELETE FROM active_proxies WHERE proxy_string=$1',
+                                [proxyAddress]
+                            );
+                            console.log('REMOVED:', proxyAddress);
+                        } catch (e) {
+                            console.error('DB delete error:', e.message);
+                        }
+                    }
+
+                    if (!res.headersSent) {
+                        res.status(500).send('Stream error');
+                    }
+                });
+
                 yt.on('close', (code) => {
                     console.log('yt-dlp exit:', code);
 
                     if (!started) {
                         console.log('NO DATA STREAMED');
+
                         if (!res.headersSent) {
                             res.status(500).end('Empty stream');
                         }
@@ -163,26 +159,10 @@ app.get('/api/tunnel', async (req, res) => {
                     res.end();
                 });
 
-                yt.on('error', async (err) => {
-                    console.log('FAIL:', proxyAddress, err.message);
-
-                    try {
-                        await pool.query(
-                            'DELETE FROM active_proxies WHERE proxy_string=$1',
-                            [proxyAddress]
-                        );
-                    } catch (e) {
-                        console.error(e.message);
-                    }
-
-                    if (!res.headersSent) {
-                        res.status(500).send('Stream error');
-                    }
-                });
-
-                return;
+                return; // stop proxy loop after start
 
             } catch (err) {
+
                 console.log('PROXY FAIL:', proxyAddress, err.message);
 
                 try {
