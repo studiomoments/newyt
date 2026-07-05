@@ -93,7 +93,7 @@ app.get('/api/tunnel', async (req, res) => {
                 const streamUrl = await new Promise((resolve, reject) => {
 
                     const cmd =
-                        `/opt/venv/bin/yt-dlp -g -f bestaudio \
+                        `/opt/venv/bin/yt-dlp -f bestaudio \
                         --no-check-certificate \
                         --add-header "User-Agent: Mozilla/5.0" \
                         --add-header "Accept-Language: en-US,en" \
