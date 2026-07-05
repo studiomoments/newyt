@@ -1,5 +1,5 @@
 import express from 'express';
-import { exec } from 'child_process';
+import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import pg from 'pg';
@@ -38,7 +38,7 @@ if (process.env.DATABASE_URL) {
 }
 
 // =========================
-// CHECK (python)
+// CHECK PROXIES (Python)
 // =========================
 app.post('/api/check', (req, res) => {
     const { input, proto, url } = req.body;
@@ -50,17 +50,27 @@ app.post('/api/check', (req, res) => {
     const cmd =
         `/opt/venv/bin/python check.py -i "${input}" -p "${proto}" -u "${url}"`;
 
-    exec(cmd, { env: process.env, timeout: 300000 }, (err, stdout, stderr) => {
-        if (err) {
-            return res.status(500).json({ error: stderr });
-        }
+    const p = spawn('/opt/venv/bin/python', [
+        'check.py',
+        '-i', input,
+        '-p', proto,
+        '-u', url
+    ]);
 
-        res.json({ output: stdout.trim() });
+    let out = '';
+    let err = '';
+
+    p.stdout.on('data', d => out += d.toString());
+    p.stderr.on('data', d => err += d.toString());
+
+    p.on('close', () => {
+        if (err) return res.status(500).json({ error: err });
+        res.json({ output: out.trim() });
     });
 });
 
 // =========================
-// API: STREAM TUNNEL (FIXED)
+// STREAM API (FIXED)
 // =========================
 app.get('/api/tunnel', async (req, res) => {
     const { target_url } = req.query;
@@ -92,27 +102,28 @@ app.get('/api/tunnel', async (req, res) => {
             try {
 
                 // =========================
-                // yt-dlp STREAM DIRECT (NO -g)
+                // yt-dlp STREAM (spawn FIX)
                 // =========================
-                const cmd =
-                    `/opt/venv/bin/yt-dlp \
-                    -f bestaudio \
-                    --no-check-certificate \
-                    --add-header "User-Agent: Mozilla/5.0" \
-                    --add-header "Accept-Language: en-US,en" \
-                    --proxy "${proxyUrl}" \
-                    -o - \
-                    "${target_url}"`;
-
-                const yt = exec(cmd, {
-                    maxBuffer: 1024 * 1024
-                });
+                const yt = spawn('/opt/venv/bin/yt-dlp', [
+                    '-f', 'bestaudio',
+                    '--no-check-certificate',
+                    '--add-header', 'User-Agent: Mozilla/5.0',
+                    '--add-header', 'Accept-Language: en-US,en',
+                    '--proxy', proxyUrl,
+                    '-o', '-',
+                    target_url
+                ]);
 
                 res.setHeader('Content-Type', 'audio/webm');
 
-                yt.stdout.pipe(res);
+                let started = false;
 
-                yt.stderr.on('data', d => {
+                yt.stdout.on('data', (chunk) => {
+                    started = true;
+                    res.write(chunk);
+                });
+
+                yt.stderr.on('data', (d) => {
                     console.log('yt-dlp:', d.toString());
                 });
 
@@ -136,11 +147,22 @@ app.get('/api/tunnel', async (req, res) => {
                     }
                 });
 
-                yt.on('exit', (code) => {
+                yt.on('close', (code) => {
                     console.log('yt-dlp exit:', code);
+
+                    if (!started) {
+                        console.log('NO DATA STREAMED');
+
+                        if (!res.headersSent) {
+                            res.status(500).end('Empty stream');
+                        }
+                        return;
+                    }
+
+                    res.end();
                 });
 
-                return; // IMPORTANT: stop loop once stream starts
+                return; // stop proxy loop after start
 
             } catch (err) {
 
@@ -151,7 +173,6 @@ app.get('/api/tunnel', async (req, res) => {
                         'DELETE FROM active_proxies WHERE proxy_string=$1',
                         [proxyAddress]
                     );
-                    console.log('REMOVED:', proxyAddress);
                 } catch (e) {
                     console.error(e.message);
                 }
@@ -167,7 +188,7 @@ app.get('/api/tunnel', async (req, res) => {
 });
 
 // =========================
-// START
+// START SERVER
 // =========================
 const PORT = process.env.PORT || 3000;
 
