@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Proxy Checker & Audio Streamer</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+        .block { border: 1px solid #ccc; padding: 20px; margin-bottom: 20px; border-radius: 6px; }
+        input, select, button { width: 100%; padding: 10px; margin: 8px 0; box-sizing: border-box; }
+        button { background-color: #28a745; color: white; border: none; cursor: pointer; font-weight: bold;}
+        button:hover { background-color: #218838; }
+        #status { font-weight: bold; color: blue; }
+    </style>
+</head>
+<body>
+
+    <h2>Управление медиа-сервером</h2>
+
+    <!-- БЛОК 1: Загрузка и проверка прокси -->
+    <div class="block">
+        <h3>1. Обновление базы прокси</h3>
+        <label>Ссылка или локальный путь (.txt):</label>
+        <input type="text" id="proxyInput" value="https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt">
+        
+        <label>Протокол:</label>
+        <select id="proxyProto">
+            <option value="socks5" selected>SOCKS5</option>
+            <option value="http">HTTP</option>
+            <option value="https">HTTPS</option>
+        </select>
+
+        <label>Проверочный сайт (URL):</label>
+        <input type="text" id="testUrl" value="https://youtube.com">
+
+        <button onclick="runChecker()">Запустить проверку и обновить БД</button>
+    </div>
+
+    <!-- БЛОК 2: Получение файла -->
+    <div class="block">
+        <h3>2. Скачивание аудио через Туннель</h3>
+        <label>Ссылка на YouTube видео:</label>
+        <input type="text" id="ytUrl" value="https://youtu.be">
+        <button onclick="downloadAudio()">Получить аудио файл (Blob fetch)</button>
+    </div>
+
+    <div id="status">Готов к работе</div>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+
+        async function runChecker() {
+            statusDiv.innerText = "🔄 Прокси проверяются и сохраняются в БД. Пожалуйста, подождите...";
+            
+            try {
+                const res = await fetch('/api/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        input: document.getElementById('proxyInput').value,
+                        proto: document.getElementById('proxyProto').value,
+                        url: document.getElementById('testUrl').value
+                    })
+                });
+                const data = await res.json();
+                statusDiv.innerText = data.error ? `❌ Ошибка: ${data.details}` : `✅ ${data.output}`;
+            } catch (e) {
+                statusDiv.innerText = "❌ Ошибка сетевого запроса к чекеру.";
+            }
+        }
+
+        async function downloadAudio() {
+            const videoUrl = document.getElementById('ytUrl').value;
+            statusDiv.innerText = "⚡ Бэкенд ищет прокси, запрашивает ссылку у yt-dlp и качает поток...";
+            
+            try {
+                // Делаем fetch запрос к нашему API туннеля
+                const response = await fetch(`/api/tunnel?target_url=${encodeURIComponent(videoUrl)}`);
+                
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+
+                // Переводим в Blob для чистого скачивания на стороне клиента
+                const blob = await response.blob();
+                const downloadUrl = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = "audio_stream.webm"; // Можно переименовать в зависимости от типа
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                
+                statusDiv.innerText = "✅ Файл успешно загружен в браузер!";
+            } catch (e) {
+                statusDiv.innerText = `❌ Ошибка загрузки: ${e.message}`;
+            }
+        }
+    </script>
+</body>
+</html>
