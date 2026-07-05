@@ -80,18 +80,6 @@ app.get('/api/tunnel', async (req, res) => {
         return res.status(500).send('DB not configured');
     }
 
-    let yt = null;
-    let killed = false;
-
-    const killProcess = () => {
-        if (yt && !killed) {
-            killed = true;
-            yt.kill('SIGKILL');
-        }
-    };
-
-    req.on('close', killProcess);
-
     try {
         const dbRes = await pool.query(
             "SELECT proxy_string FROM active_proxies WHERE protocol='socks5' ORDER BY RANDOM()"
@@ -102,73 +90,58 @@ app.get('/api/tunnel', async (req, res) => {
         }
 
         for (const row of dbRes.rows) {
+
             const proxyAddress = row.proxy_string;
             const proxyUrl = `socks5://${proxyAddress}`;
 
-            console.log('TRY PROXY:', proxyAddress);
+            console.log('TRY:', proxyAddress);
 
             try {
-                let filename = null;
-                let headerSent = false;
-                let startedStream = false;
 
-                yt = spawn('/opt/venv/bin/yt-dlp', [
-                    '-f', 'bestaudio[ext=m4a]/bestaudio',
+                // =========================
+                // 1. GET TITLE FIRST
+                // =========================
+                const title = await new Promise((resolve) => {
+                    const p = spawn('/opt/venv/bin/yt-dlp', [
+                        '--print', '%(title)s',
+                        '--no-check-certificate',
+                        '--proxy', proxyUrl,
+                        target_url
+                    ]);
+
+                    let out = '';
+
+                    p.stdout.on('data', d => out += d.toString());
+
+                    p.on('close', () => {
+                        resolve(out.trim() || 'audio');
+                    });
+                });
+
+                // clean filename
+                const safeTitle = title.replace(/[^a-z0-9а-яё_\- ]/gi, '').slice(0, 80);
+
+                res.setHeader('Content-Type', 'audio/mpeg');
+                res.setHeader(
+                    'Content-Disposition',
+                    `attachment; filename="${safeTitle}.m4a"`
+                );
+
+                // =========================
+                // 2. STREAM AUDIO
+                // =========================
+                const yt = spawn('/opt/venv/bin/yt-dlp', [
+                    '-f', 'bestaudio',
                     '--no-check-certificate',
-                    '--add-header', 'User-Agent: Mozilla/5.0',
-                    '--add-header', 'Accept-Language: en-US,en',
                     '--proxy', proxyUrl,
-                    '--print', 'filename:%(title)s.%(ext)s',
                     '-o', '-',
                     target_url
                 ]);
 
-                let buffer = '';
+                let started = false;
 
                 yt.stdout.on('data', (chunk) => {
-                    const text = chunk.toString();
-
-                    // 1) сначала ловим filename
-                    if (!startedStream) {
-                        buffer += text;
-
-                        const match = buffer.match(/filename:(.+)/);
-
-                        if (match) {
-                            filename = match[1].trim();
-                            console.log('FILENAME:', filename);
-
-                            startedStream = true;
-
-                            if (!headerSent) {
-                                res.setHeader(
-                                    'Content-Type',
-                                    'audio/mpeg'
-                                );
-
-                                // можно отдать имя файла клиенту
-                                res.setHeader(
-                                    'X-Filename',
-                                    filename.endsWith('.m4a')
-                                        ? filename
-                                        : filename + '.m4a'
-                                );
-
-                                headerSent = true;
-                            }
-
-                            // убираем метаданные из потока
-                            const clean = buffer.split('\n').slice(1).join('\n');
-                            if (clean) res.write(clean);
-
-                            return;
-                        }
-
-                        return;
-                    }
-
-                    // 2) уже поток аудио
-                    startedStream = true;
+                    started = true;
                     res.write(chunk);
                 });
 
@@ -176,10 +149,22 @@ app.get('/api/tunnel', async (req, res) => {
                     console.log('yt-dlp:', d.toString());
                 });
 
-                yt.on('error', async (err) => {
-                    console.log('YT ERROR:', err.message);
+                yt.on('close', (code) => {
+                    console.log('yt-dlp exit:', code);
 
-                    killProcess();
+                    if (!started) {
+                        console.log('NO DATA STREAMED');
+                        if (!res.headersSent) {
+                            res.status(500).end('Empty stream');
+                        }
+                        return;
+                    }
+
+                    res.end();
+                });
+
+                yt.on('error', async (err) => {
+                    console.log('FAIL:', proxyAddress, err.message);
 
                     try {
                         await pool.query(
@@ -187,7 +172,7 @@ app.get('/api/tunnel', async (req, res) => {
                             [proxyAddress]
                         );
                     } catch (e) {
-                        console.error('DB delete error:', e.message);
+                        console.error(e.message);
                     }
 
                     if (!res.headersSent) {
@@ -195,17 +180,7 @@ app.get('/api/tunnel', async (req, res) => {
                     }
                 });
 
-                yt.on('close', (code) => {
-                    console.log('yt-dlp exit:', code);
-
-                    if (!startedStream && !res.headersSent) {
-                        return res.status(500).send('Empty stream');
-                    }
-
-                    res.end();
-                });
-
-                return; // success proxy started
+                return;
 
             } catch (err) {
                 console.log('PROXY FAIL:', proxyAddress, err.message);
@@ -218,8 +193,6 @@ app.get('/api/tunnel', async (req, res) => {
                 } catch (e) {
                     console.error(e.message);
                 }
-
-                killProcess();
             }
         }
 
