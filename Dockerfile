@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 WORKDIR /app
 
 # Шаг 6: Устанавливаем Node.js пакеты (Express, Axios, PostgreSQL, Прокси-агент)
-RUN npm install express socks-proxy-agent pg undici
+RUN npm install express socks-proxy-agent pg 
 
 # Шаг 7: Копируем все файлы проекта (server.js, check.py, index.html) внутрь контейнера
 COPY . .
