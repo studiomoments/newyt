@@ -47,9 +47,6 @@ app.post('/api/check', (req, res) => {
         return res.status(400).json({ error: 'missing params' });
     }
 
-    const cmd =
-        `/opt/venv/bin/python check.py -i "${input}" -p "${proto}" -u "${url}"`;
-
     const p = spawn('/opt/venv/bin/python', [
         'check.py',
         '-i', input,
@@ -83,6 +80,18 @@ app.get('/api/tunnel', async (req, res) => {
         return res.status(500).send('DB not configured');
     }
 
+    let yt = null;
+    let killed = false;
+
+    const killProcess = () => {
+        if (yt && !killed) {
+            killed = true;
+            yt.kill('SIGKILL');
+        }
+    };
+
+    req.on('close', killProcess);
+
     try {
         const dbRes = await pool.query(
             "SELECT proxy_string FROM active_proxies WHERE protocol='socks5' ORDER BY RANDOM()"
@@ -93,33 +102,73 @@ app.get('/api/tunnel', async (req, res) => {
         }
 
         for (const row of dbRes.rows) {
-
             const proxyAddress = row.proxy_string;
             const proxyUrl = `socks5://${proxyAddress}`;
 
-            console.log('TRY:', proxyAddress);
+            console.log('TRY PROXY:', proxyAddress);
 
             try {
+                let filename = null;
+                let headerSent = false;
+                let startedStream = false;
 
-                // =========================
-                // yt-dlp STREAM (spawn FIX)
-                // =========================
-                const yt = spawn('/opt/venv/bin/yt-dlp', [
+                yt = spawn('/opt/venv/bin/yt-dlp', [
                     '-f', 'bestaudio[ext=m4a]/bestaudio',
                     '--no-check-certificate',
                     '--add-header', 'User-Agent: Mozilla/5.0',
                     '--add-header', 'Accept-Language: en-US,en',
                     '--proxy', proxyUrl,
+                    '--print', 'filename:%(title)s.%(ext)s',
                     '-o', '-',
                     target_url
                 ]);
 
-                res.setHeader('Content-Type', 'audio/webm');
-
-                let started = false;
+                let buffer = '';
 
                 yt.stdout.on('data', (chunk) => {
-                    started = true;
+                    const text = chunk.toString();
+
+                    // 1) сначала ловим filename
+                    if (!startedStream) {
+                        buffer += text;
+
+                        const match = buffer.match(/filename:(.+)/);
+
+                        if (match) {
+                            filename = match[1].trim();
+                            console.log('FILENAME:', filename);
+
+                            startedStream = true;
+
+                            if (!headerSent) {
+                                res.setHeader(
+                                    'Content-Type',
+                                    'audio/mpeg'
+                                );
+
+                                // можно отдать имя файла клиенту
+                                res.setHeader(
+                                    'X-Filename',
+                                    filename.endsWith('.m4a')
+                                        ? filename
+                                        : filename + '.m4a'
+                                );
+
+                                headerSent = true;
+                            }
+
+                            // убираем метаданные из потока
+                            const clean = buffer.split('\n').slice(1).join('\n');
+                            if (clean) res.write(clean);
+
+                            return;
+                        }
+
+                        return;
+                    }
+
+                    // 2) уже поток аудио
+                    startedStream = true;
                     res.write(chunk);
                 });
 
@@ -128,18 +177,17 @@ app.get('/api/tunnel', async (req, res) => {
                 });
 
                 yt.on('error', async (err) => {
-                    console.log('FAIL:', proxyAddress, err.message);
+                    console.log('YT ERROR:', err.message);
 
-                    if (pool) {
-                        try {
-                            await pool.query(
-                                'DELETE FROM active_proxies WHERE proxy_string=$1',
-                                [proxyAddress]
-                            );
-                            console.log('REMOVED:', proxyAddress);
-                        } catch (e) {
-                            console.error('DB delete error:', e.message);
-                        }
+                    killProcess();
+
+                    try {
+                        await pool.query(
+                            'DELETE FROM active_proxies WHERE proxy_string=$1',
+                            [proxyAddress]
+                        );
+                    } catch (e) {
+                        console.error('DB delete error:', e.message);
                     }
 
                     if (!res.headersSent) {
@@ -150,22 +198,16 @@ app.get('/api/tunnel', async (req, res) => {
                 yt.on('close', (code) => {
                     console.log('yt-dlp exit:', code);
 
-                    if (!started) {
-                        console.log('NO DATA STREAMED');
-
-                        if (!res.headersSent) {
-                            res.status(500).end('Empty stream');
-                        }
-                        return;
+                    if (!startedStream && !res.headersSent) {
+                        return res.status(500).send('Empty stream');
                     }
 
                     res.end();
                 });
 
-                return; // stop proxy loop after start
+                return; // success proxy started
 
             } catch (err) {
-
                 console.log('PROXY FAIL:', proxyAddress, err.message);
 
                 try {
@@ -176,6 +218,8 @@ app.get('/api/tunnel', async (req, res) => {
                 } catch (e) {
                     console.error(e.message);
                 }
+
+                killProcess();
             }
         }
 
