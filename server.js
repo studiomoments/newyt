@@ -4,7 +4,7 @@ import { SocksProxyAgent } from 'socks-proxy-agent';
 import { exec } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import pg from 'pg'; // Используем pg вместо sqlite3
+import pg from 'pg';
 
 const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,117 +12,167 @@ const app = express();
 
 app.use(express.json());
 app.use(express.static(__dirname));
-console.log("DATABASE_URL:", process.env.DATABASE_URL ? "найден" : "НЕ НАЙДЕН");
-// Подключение к PostgreSQL через переменную окружения Render
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } // Обязательно для облачных БД типа Render/AWS
-});
 
-// Инициализация таблицы при запуске сервера
-pool.query(`
-    CREATE TABLE IF NOT EXISTS active_proxies (
-        id SERIAL PRIMARY KEY,
-        proxy_string TEXT UNIQUE,
-        protocol TEXT
-    )
-`).catch(err => console.error("Ошибка инициализации таблицы БД:", err));
+console.log('DATABASE_URL:', process.env.DATABASE_URL ? 'найден' : 'НЕ НАЙДЕН');
 
-// Маршрут для запуска проверки прокси
-// Маршрут для запуска проверки прокси
+// =========================
+// POSTGRESQL INIT
+// =========================
+let pool = null;
+
+if (process.env.DATABASE_URL) {
+    pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
+    });
+
+    pool.query(`
+        CREATE TABLE IF NOT EXISTS active_proxies (
+            id SERIAL PRIMARY KEY,
+            proxy_string TEXT UNIQUE,
+            protocol TEXT
+        )
+    `).catch(err => console.error('DB init error:', err));
+
+} else {
+    console.error('DATABASE_URL отсутствует');
+}
+
+// =========================
+// CHECK PROXIES (Python)
+// =========================
 app.post('/api/check', (req, res) => {
     const { input, proto, url } = req.body;
 
     if (!input || !proto || !url) {
-        return res.status(400).json({ error: "Переданы не все параметры" });
+        return res.status(400).json({ error: 'Missing params' });
     }
 
     if (!process.env.DATABASE_URL) {
-        return res.status(500).json({
-            error: "DATABASE_URL отсутствует в Environment Variables"
-        });
+        return res.status(500).json({ error: 'DATABASE_URL not set' });
     }
 
-    const command = `/opt/venv/bin/python check.py -i "${input}" -p "${proto}" -u "${url}"`;
+    const cmd = `/opt/venv/bin/python check.py -i "${input}" -p "${proto}" -u "${url}"`;
 
     exec(
-        command,
-        {
-            env: process.env
-        },
+        cmd,
+        { env: process.env, timeout: 300000 },
         (error, stdout, stderr) => {
             if (error) {
                 console.error(stderr);
-                return res.status(500).json({
-                    error: "Ошибка выполнения Python",
-                    details: stderr
-                });
+                return res.status(500).json({ error: stderr });
             }
 
             res.json({
-                message: "Проверка завершена",
+                message: 'done',
                 output: stdout.trim()
             });
         }
     );
 });
 
-
-// Туннелирование потока
+// =========================
+// TUNNEL WITH PROXY ROTATION
+// =========================
 app.get('/api/tunnel', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET');
 
     const { target_url } = req.query;
-    if (!target_url) return res.status(400).send("Укажите target_url");
+    if (!target_url) return res.status(400).send('No target_url');
+
+    if (!pool) return res.status(500).send('DB not configured');
 
     try {
-        // Достаем случайный прокси из PostgreSQL
         const dbRes = await pool.query(
-            "SELECT proxy_string FROM active_proxies WHERE protocol = 'socks5' ORDER BY RANDOM() LIMIT 1"
+            "SELECT proxy_string FROM active_proxies WHERE protocol='socks5' ORDER BY RANDOM()"
         );
 
-        if (dbRes.rows.length === 0) {
-            return res.status(500).send("Нет доступных рабочих прокси в PostgreSQL. Запустите проверку!");
+        if (!dbRes.rows.length) {
+            return res.status(500).send('No proxies');
         }
 
-        const proxyAddress = dbRes.rows[0].proxy_string;
-        const proxyUrl = `socks5://${proxyAddress}`;
+        for (const row of dbRes.rows) {
 
-        const ytdlpCmd = `/opt/venv/bin/yt-dlp -g -f bestaudio --js-runtimes node --proxy "${proxyUrl}" "${target_url}"`;
+            const proxyAddress = row.proxy_string;
+            const proxyUrl = `socks5://${proxyAddress}`;
 
-        exec(ytdlpCmd, async (ytErr, stdout, ytStderr) => {
-            if (ytErr) {
-                console.error("Ошибка yt-dlp:", ytStderr);
-                return res.status(500).send("Не удалось получить streamurl через прокси.");
-            }
-
-            const streamUrl = stdout.trim();
+            console.log('TRY:', proxyAddress);
 
             try {
+                const streamUrl = await new Promise((resolve, reject) => {
+
+                    const cmd =
+                        `/opt/venv/bin/yt-dlp -g -f bestaudio --proxy "${proxyUrl}" "${target_url}"`;
+
+                    exec(
+                        cmd,
+                        { timeout: 30000, maxBuffer: 1024 * 1024 },
+                        (err, stdout, stderr) => {
+
+                            if (stderr) console.log('yt-dlp:', stderr);
+
+                            if (err) return reject(err);
+
+                            resolve(stdout.trim());
+                        }
+                    );
+                });
+
+                console.log('STREAM OK:', streamUrl);
+
                 const agent = new SocksProxyAgent(proxyUrl);
-                const youtubeResponse = await axios({
+
+                const response = await axios({
                     method: 'get',
                     url: streamUrl,
                     responseType: 'stream',
                     httpsAgent: agent,
-                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+                    timeout: 15000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0'
+                    }
                 });
 
-                res.setHeader('Content-Type', youtubeResponse.headers['content-type'] || 'audio/webm');
-                youtubeResponse.data.pipe(res);
+                console.log('SUCCESS:', proxyAddress);
 
-            } catch (error) {
-                console.error("Ошибка туннелирования байт:", error.message);
-                res.status(500).send("Ошибка стриминга данных.");
+                res.setHeader(
+                    'Content-Type',
+                    response.headers['content-type'] || 'application/octet-stream'
+                );
+
+                response.data.pipe(res);
+                return;
+
+            } catch (err) {
+
+                console.log('FAIL:', proxyAddress, err.message);
+
+                if (pool) {
+                    try {
+                        await pool.query(
+                            'DELETE FROM active_proxies WHERE proxy_string=$1',
+                            [proxyAddress]
+                        );
+                        console.log('REMOVED:', proxyAddress);
+                    } catch (e) {
+                        console.error('DB delete error:', e.message);
+                    }
+                }
             }
-        });
+        }
+
+        res.status(500).send('No working proxies');
 
     } catch (dbErr) {
-        console.error("Ошибка БД:", dbErr.message);
-        res.status(500).send("Ошибка при обращении к базе данных.");
+        console.error('DB error:', dbErr.message);
+        res.status(500).send('Database error');
     }
 });
 
+// =========================
+// START
+// =========================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
+app.listen(PORT, () => {
+    console.log('Server running on port', PORT);
+});
