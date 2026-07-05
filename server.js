@@ -97,8 +97,9 @@ app.get('/api/tunnel', async (req, res) => {
                         --no-check-certificate \
                         --add-header "User-Agent: Mozilla/5.0" \
                         --add-header "Accept-Language: en-US,en" \
-                        --proxy "${proxyUrl}" "${target_url}"`;
-
+                        --proxy "${proxyUrl}" \
+                        -o - \
+                        "${target_url}"`;
                     exec(cmd,
                         { timeout: 30000, maxBuffer: 1024 * 1024 },
                         (err, stdout, stderr) => {
