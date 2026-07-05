@@ -10,7 +10,13 @@ parser = argparse.ArgumentParser(description="Асинхронный чекер 
 parser.add_argument("-i", "--input", required=True)
 parser.add_argument("-p", "--proto", required=True, choices=["http", "https", "socks5"])
 parser.add_argument("-u", "--url", required=True)
-parser.add_argument("-o", "--output", default=os.getenv("DATABASE_URL"), help="Строка подключения PostgreSQL")
+
+parser.add_argument(
+    "-o",
+    "--output",
+    default=None,
+    help="Строка подключения PostgreSQL"
+)
 parser.add_argument("-t", "--timeout", type=int, default=5)
 parser.add_argument("-l", "--limit", type=int, default=500)
 
@@ -48,9 +54,10 @@ async def check_single_proxy(semaphore, session, proxy_str, proto, test_url, tim
         return None
 
 async def main():
-    # 🔥 ЗАЩИТА: Проверяем строку на пустоту и текстовый флаг "undefined"
-    if not args.output or args.output.strip() == "" or args.output == "undefined":
-        print("❌ Ошибка: Передана пустая или невалидная строка подключения к PostgreSQL (DATABASE_URL)")
+    db_url = args.output or os.getenv("DATABASE_URL")
+
+    if not db_url:
+        print("❌ DATABASE_URL не задан")
         return
 
     proxies = []
@@ -79,7 +86,7 @@ async def main():
     working_proxies = [res for res in results if res is not None]
 
     # Сохранение в PostgreSQL
-    conn = init_db(args.output)
+    conn = init_db(db_url)
     cursor = conn.cursor()
     
     # Очищаем старые прокси этого же протокола

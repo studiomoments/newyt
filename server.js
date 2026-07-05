@@ -12,7 +12,7 @@ const app = express();
 
 app.use(express.json());
 app.use(express.static(__dirname));
-
+console.log("DATABASE_URL:", process.env.DATABASE_URL ? "найден" : "НЕ НАЙДЕН");
 // Подключение к PostgreSQL через переменную окружения Render
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -32,31 +32,39 @@ pool.query(`
 // Маршрут для запуска проверки прокси
 app.post('/api/check', (req, res) => {
     const { input, proto, url } = req.body;
-    
+
     if (!input || !proto || !url) {
         return res.status(400).json({ error: "Переданы не все параметры" });
     }
 
-    const dbUrl = process.env.DATABASE_URL;
-
-    // 🔥 ЗАЩИТА: Проверяем, что переменная окружения существует
-    if (!dbUrl || dbUrl === 'undefined') {
-        return res.status(500).json({ 
-            error: "Ошибка конфигурации сервера", 
-            details: "Переменная окружения DATABASE_URL не найдена на Render.com! Проверьте вкладку Environment." 
+    if (!process.env.DATABASE_URL) {
+        return res.status(500).json({
+            error: "DATABASE_URL отсутствует в Environment Variables"
         });
     }
 
-    // Оборачиваем строку подключения в кавычки для безопасной передачи в терминал
-    const command = `/opt/venv/bin/python check.py -i "${input}" -p "${proto}" -u "${url}" -o "${dbUrl}"`;
-    
-    exec(command, (error, stdout, stderr) => {
-        if (error) {
-            console.error(stderr);
-            return res.status(500).json({ error: "Ошибка при выполнении чекера", details: stderr });
+    const command = `/opt/venv/bin/python check.py -i "${input}" -p "${proto}" -u "${url}"`;
+
+    exec(
+        command,
+        {
+            env: process.env
+        },
+        (error, stdout, stderr) => {
+            if (error) {
+                console.error(stderr);
+                return res.status(500).json({
+                    error: "Ошибка выполнения Python",
+                    details: stderr
+                });
+            }
+
+            res.json({
+                message: "Проверка завершена",
+                output: stdout.trim()
+            });
         }
-        res.json({ message: "Проверка успешно завершена", output: stdout.trim() });
-    });
+    );
 });
 
 
@@ -64,7 +72,7 @@ app.post('/api/check', (req, res) => {
 app.get('/api/tunnel', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET');
-    
+
     const { target_url } = req.query;
     if (!target_url) return res.status(400).send("Укажите target_url");
 
