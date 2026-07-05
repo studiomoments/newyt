@@ -29,6 +29,7 @@ pool.query(`
 `).catch(err => console.error("Ошибка инициализации таблицы БД:", err));
 
 // Маршрут для запуска проверки прокси
+// Маршрут для запуска проверки прокси
 app.post('/api/check', (req, res) => {
     const { input, proto, url } = req.body;
     
@@ -36,8 +37,17 @@ app.post('/api/check', (req, res) => {
         return res.status(400).json({ error: "Переданы не все параметры" });
     }
 
-    // Передаем строку подключения из env в питон
     const dbUrl = process.env.DATABASE_URL;
+
+    // 🔥 ЗАЩИТА: Проверяем, что переменная окружения существует
+    if (!dbUrl || dbUrl === 'undefined') {
+        return res.status(500).json({ 
+            error: "Ошибка конфигурации сервера", 
+            details: "Переменная окружения DATABASE_URL не найдена на Render.com! Проверьте вкладку Environment." 
+        });
+    }
+
+    // Оборачиваем строку подключения в кавычки для безопасной передачи в терминал
     const command = `/opt/venv/bin/python check.py -i "${input}" -p "${proto}" -u "${url}" -o "${dbUrl}"`;
     
     exec(command, (error, stdout, stderr) => {
@@ -48,6 +58,7 @@ app.post('/api/check', (req, res) => {
         res.json({ message: "Проверка успешно завершена", output: stdout.trim() });
     });
 });
+
 
 // Туннелирование потока
 app.get('/api/tunnel', async (req, res) => {

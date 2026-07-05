@@ -48,8 +48,9 @@ async def check_single_proxy(semaphore, session, proxy_str, proto, test_url, tim
         return None
 
 async def main():
-    if not args.output:
-        print("❌ Ошибка: Не указана строка подключения к PostgreSQL (DATABASE_URL)")
+    # 🔥 ЗАЩИТА: Проверяем строку на пустоту и текстовый флаг "undefined"
+    if not args.output or args.output.strip() == "" or args.output == "undefined":
+        print("❌ Ошибка: Передана пустая или невалидная строка подключения к PostgreSQL (DATABASE_URL)")
         return
 
     proxies = []
