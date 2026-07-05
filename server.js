@@ -72,13 +72,16 @@ app.post('/api/check', (req, res) => {
 // =========================
 // STREAM API (FIXED)
 // =========================
-
-
 app.get('/api/tunnel', async (req, res) => {
     const { target_url } = req.query;
 
-    if (!target_url) return res.status(400).send('No target_url');
-    if (!pool) return res.status(500).send('DB not configured');
+    if (!target_url) {
+        return res.status(400).send('No target_url');
+    }
+
+    if (!pool) {
+        return res.status(500).send('DB not configured');
+    }
 
     try {
         const dbRes = await pool.query(
@@ -89,128 +92,100 @@ app.get('/api/tunnel', async (req, res) => {
             return res.status(500).send('No proxies');
         }
 
-        // Итерируемся по прокси. Обернуто в Promise, чтобы цикл ЖДАЛ исхода работы
         for (const row of dbRes.rows) {
+
             const proxyAddress = row.proxy_string;
             const proxyUrl = `socks5://${proxyAddress}`;
-            console.log('TRY PROXY:', proxyAddress);
+
+            console.log('TRY:', proxyAddress);
 
             try {
-                // Ждем завершения стрима или ошибки этого конкретного прокси
-                await startStreaming(proxyUrl, target_url, res);
-                return; // Если успешно завершилось — выходим из эндпоинта
+
+                // =========================
+                // yt-dlp STREAM (spawn FIX)
+                // =========================
+                const yt = spawn('/opt/venv/bin/yt-dlp', [
+                    '-f', 'bestaudio[ext=m4a]/bestaudio',
+                    '--no-check-certificate',
+                    '--add-header', 'User-Agent: Mozilla/5.0',
+                    '--add-header', 'Accept-Language: en-US,en',
+                    '--proxy', proxyUrl,
+                    '-o', '-',
+                    target_url
+                ]);
+
+                res.setHeader('Content-Type', 'audio/webm');
+
+                let started = false;
+
+                yt.stdout.on('data', (chunk) => {
+                    started = true;
+                    res.write(chunk);
+                });
+
+                yt.stderr.on('data', (d) => {
+                    console.log('yt-dlp:', d.toString());
+                });
+
+                yt.on('error', async (err) => {
+                    console.log('FAIL:', proxyAddress, err.message);
+
+                    if (pool) {
+                        try {
+                            await pool.query(
+                                'DELETE FROM active_proxies WHERE proxy_string=$1',
+                                [proxyAddress]
+                            );
+                            console.log('REMOVED:', proxyAddress);
+                        } catch (e) {
+                            console.error('DB delete error:', e.message);
+                        }
+                    }
+
+                    if (!res.headersSent) {
+                        res.status(500).send('Stream error');
+                    }
+                });
+
+                yt.on('close', (code) => {
+                    console.log('yt-dlp exit:', code);
+
+                    if (!started) {
+                        console.log('NO DATA STREAMED');
+
+                        if (!res.headersSent) {
+                            res.status(500).end('Empty stream');
+                        }
+                        return;
+                    }
+
+                    res.end();
+                });
+
+                return; // stop proxy loop after start
+
             } catch (err) {
+
                 console.log('PROXY FAIL:', proxyAddress, err.message);
 
                 try {
-                    await pool.query('DELETE FROM active_proxies WHERE proxy_string=$1', [proxyAddress]);
-                    console.log('REMOVED BAD PROXY:', proxyAddress);
+                    await pool.query(
+                        'DELETE FROM active_proxies WHERE proxy_string=$1',
+                        [proxyAddress]
+                    );
                 } catch (e) {
-                    console.error('DB delete error:', e.message);
+                    console.error(e.message);
                 }
-
-                // Если данные уже начали уходить клиенту, мы не можем переключить прокси посередине трека
-                if (res.headersSent) {
-                    console.error('Headers already sent. Cannot switch proxy mid-stream.');
-                    return;
-                }
-                // Если заголовки не отправлены, цикл перейдет к следующей строке (следующему прокси)
             }
         }
 
-        if (!res.headersSent) res.status(500).send('No working proxies');
+        res.status(500).send('No working proxies');
 
     } catch (e) {
         console.error('DB error:', e.message);
-        if (!res.headersSent) res.status(500).send('Database error');
+        res.status(500).send('Database error');
     }
 });
-
-// Вынесенная функция для управления потоком yt-dlp
-function startStreaming(proxyUrl, targetUrl, res) {
-    return new Promise((resolve, reject) => {
-        // Запускаем yt-dlp с флагом --print, чтобы он выдал имя файла ПЕРЕД бинарным потоком
-        const yt = spawn('/opt/venv/bin/yt-dlp', [
-            '-f', 'bestaudio[ext=m4a]/bestaudio',
-            '--no-check-certificate',
-            '--add-header', 'User-Agent: Mozilla/5.0',
-            '--add-header', 'Accept-Language: en-US,en',
-            '--proxy', proxyUrl,
-            '--print', 'filename:%(title)s.%(ext)s', // Печатаем "filename:Название.расширение" первой строкой
-            '-o', '-',
-            targetUrl
-        ]);
-
-        let headersSentLocal = false;
-        let buffer = Buffer.alloc(0);
-
-        yt.stdout.on('data', (chunk) => {
-            if (!headersSentLocal) {
-                // Накапливаем данные, пока не найдем перенос строки, чтобы вырезать имя файла
-                buffer = Buffer.concat([buffer, chunk]);
-                const index = buffer.indexOf('\n');
-
-                if (index !== -1) {
-                    // Выделяем строку с именем файла
-                    const line = buffer.slice(0, index).toString().trim();
-                    // Оставшийся хвост чанка — это уже чистое аудио
-                    const audioTail = buffer.slice(index + 1);
-
-                    let filename = 'audio.webm'; // дефолтное имя
-                    if (line.startsWith('filename:')) {
-                        filename = line.replace('filename:', '').trim();
-                    }
-
-                    // Очищаем имя от запрещенных символов для файловой системы
-                    const safeTitle = filename.replace(/[^a-z0-9а-яё_\-.]/gi, ' ').trim().slice(0, 100);
-
-                    // Определяем MIME-тип на основе расширения видео
-                    const ext = safeTitle.split('.').pop().toLowerCase();
-                    const contentType = ext === 'm4a' ? 'audio/mp4' : 'audio/webm';
-
-                    // Отправляем заголовки клиенту
-                    res.setHeader('Content-Type', contentType);
-                    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}"`);
-                    headersSentLocal = true;
-
-                    // Пушим остаток аудио-данных из первого чанка
-                    if (audioTail.length > 0) {
-                        res.write(audioTail);
-                    }
-                    // Очищаем буфер
-                    buffer = null;
-                }
-            } else {
-                // Если заголовки уже ушли, просто гоним бинарный поток
-                res.write(chunk);
-            }
-        });
-
-        yt.stderr.on('data', (d) => {
-            const msg = d.toString();
-            if (msg.includes('ERROR:')) console.log('yt-dlp error:', msg.trim());
-        });
-
-        yt.on('error', (err) => {
-            reject(err);
-        });
-
-        yt.on('close', (code) => {
-            console.log('yt-dlp exit:', code);
-            if (code === 0 && headersSentLocal) {
-                res.end();
-                resolve();
-            } else {
-                if (!headersSentLocal) {
-                    reject(new Error(`Failed before streaming started. Code: ${code}`));
-                } else {
-                    res.end(); // Обрываем стрим
-                    reject(new Error(`Stream interrupted. Code: ${code}`));
-                }
-            }
-        });
-    });
-}
 
 // =========================
 // START SERVER
