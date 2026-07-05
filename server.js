@@ -1,4 +1,5 @@
 import express from 'express';
+import { request } from 'undici';
 import { exec } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -38,7 +39,7 @@ if (process.env.DATABASE_URL) {
 }
 
 // =========================
-// CHECK (python)
+// CHECK PROXIES
 // =========================
 app.post('/api/check', (req, res) => {
     const { input, proto, url } = req.body;
@@ -60,18 +61,13 @@ app.post('/api/check', (req, res) => {
 });
 
 // =========================
-// API: STREAM TUNNEL (FIXED)
+// TUNNEL (NO COOKIES VERSION)
 // =========================
 app.get('/api/tunnel', async (req, res) => {
     const { target_url } = req.query;
 
-    if (!target_url) {
-        return res.status(400).send('No target_url');
-    }
-
-    if (!pool) {
-        return res.status(500).send('DB not configured');
-    }
+    if (!target_url) return res.status(400).send('No target_url');
+    if (!pool) return res.status(500).send('DB not configured');
 
     try {
         const dbRes = await pool.query(
@@ -92,60 +88,62 @@ app.get('/api/tunnel', async (req, res) => {
             try {
 
                 // =========================
-                // yt-dlp STREAM DIRECT (NO -g)
+                // yt-dlp (NO COOKIES)
                 // =========================
-                const cmd =
-                    `/opt/venv/bin/yt-dlp \
-                    -f bestaudio \
-                    --no-check-certificate \
-                    --add-header "User-Agent: Mozilla/5.0" \
-                    --add-header "Accept-Language: en-US,en" \
-                    --proxy "${proxyUrl}" \
-                    -o - \
-                    "${target_url}"`;
+                const streamUrl = await new Promise((resolve, reject) => {
 
-                const yt = exec(cmd, {
-                    maxBuffer: 1024 * 1024
-                });
+                    const cmd =
+                        `/opt/venv/bin/yt-dlp -g -f bestaudio \
+                        --no-check-certificate \
+                        --add-header "User-Agent: Mozilla/5.0" \
+                        --add-header "Accept-Language: en-US,en" \
+                        --proxy "${proxyUrl}" "${target_url}"`;
 
-                res.setHeader('Content-Type', 'audio/webm');
+                    exec(cmd,
+                        { timeout: 30000, maxBuffer: 1024 * 1024 },
+                        (err, stdout, stderr) => {
 
-                yt.stdout.pipe(res);
+                            if (stderr) console.log('yt-dlp:', stderr);
 
-                yt.stderr.on('data', d => {
-                    console.log('yt-dlp:', d.toString());
-                });
+                            if (err) return reject(err);
 
-                yt.on('error', async (err) => {
-                    console.log('FAIL:', proxyAddress, err.message);
-
-                    if (pool) {
-                        try {
-                            await pool.query(
-                                'DELETE FROM active_proxies WHERE proxy_string=$1',
-                                [proxyAddress]
-                            );
-                            console.log('REMOVED:', proxyAddress);
-                        } catch (e) {
-                            console.error('DB delete error:', e.message);
+                            resolve(stdout.trim());
                         }
-                    }
+                    );
+                });
 
-                    if (!res.headersSent) {
-                        res.status(500).send('Stream error');
+                console.log('STREAM URL OK');
+
+                // =========================
+                // STREAM FIXED (undici)
+                // =========================
+                const { body, headers, statusCode } = await request(streamUrl, {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0',
+                        'Accept': '*/*',
+                        'Range': 'bytes=0-'
                     }
                 });
 
-                yt.on('exit', (code) => {
-                    console.log('yt-dlp exit:', code);
-                });
+                if (statusCode !== 200) {
+                    throw new Error('Bad status ' + statusCode);
+                }
 
-                return; // IMPORTANT: stop loop once stream starts
+                console.log('SUCCESS:', proxyAddress);
+
+                res.setHeader(
+                    'Content-Type',
+                    headers['content-type'] || 'audio/webm'
+                );
+
+                body.pipe(res);
+                return;
 
             } catch (err) {
 
-                console.log('PROXY FAIL:', proxyAddress, err.message);
+                console.log('FAIL:', proxyAddress, err.message);
 
+                // удалить мёртвый прокси
                 try {
                     await pool.query(
                         'DELETE FROM active_proxies WHERE proxy_string=$1',
@@ -153,7 +151,7 @@ app.get('/api/tunnel', async (req, res) => {
                     );
                     console.log('REMOVED:', proxyAddress);
                 } catch (e) {
-                    console.error(e.message);
+                    console.error('DB delete error:', e.message);
                 }
             }
         }
@@ -174,3 +172,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log('Server running on', PORT);
 });
+
