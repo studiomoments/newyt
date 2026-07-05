@@ -1,27 +1,27 @@
 import asyncio
 import argparse
-import sqlite3
+import os
 import urllib.request
 import aiohttp
+import psycopg2  # Используем pg вместо sqlite3
 from aiohttp_socks import ProxyConnector
 
-parser = argparse.ArgumentParser(description="Асинхронный чекер прокси с сохранением в SQLite.")
+parser = argparse.ArgumentParser(description="Асинхронный чекер прокси с сохранением в PostgreSQL.")
 parser.add_argument("-i", "--input", required=True)
 parser.add_argument("-p", "--proto", required=True, choices=["http", "https", "socks5"])
 parser.add_argument("-u", "--url", required=True)
-parser.add_argument("-o", "--output", default="proxies.db", help="Путь к файлу базы данных SQLite")
+parser.add_argument("-o", "--output", default=os.getenv("DATABASE_URL"), help="Строка подключения PostgreSQL")
 parser.add_argument("-t", "--timeout", type=int, default=5)
 parser.add_argument("-l", "--limit", type=int, default=500)
 
 args = parser.parse_args()
 
-# Инициализация базы данных
-def init_db(db_path):
-    conn = sqlite3.connect(db_path)
+def init_db(db_url):
+    conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS active_proxies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             proxy_string TEXT UNIQUE,
             protocol TEXT
         )
@@ -48,6 +48,10 @@ async def check_single_proxy(semaphore, session, proxy_str, proto, test_url, tim
         return None
 
 async def main():
+    if not args.output:
+        print("❌ Ошибка: Не указана строка подключения к PostgreSQL (DATABASE_URL)")
+        return
+
     proxies = []
     if args.input.startswith("http://") or args.input.startswith("https://"):
         try:
@@ -73,23 +77,27 @@ async def main():
 
     working_proxies = [res for res in results if res is not None]
 
-    # Сохранение в базу данных
+    # Сохранение в PostgreSQL
     conn = init_db(args.output)
     cursor = conn.cursor()
     
     # Очищаем старые прокси этого же протокола
-    cursor.execute("DELETE FROM active_proxies WHERE protocol = ?", (args.proto,))
+    cursor.execute("DELETE FROM active_proxies WHERE protocol = %s", (args.proto,))
     
     # Записываем новые живые прокси
     for proxy in working_proxies:
         try:
-            cursor.execute("INSERT OR IGNORE INTO active_proxies (proxy_string, protocol) VALUES (?, ?)", (proxy, args.proto))
+            cursor.execute(
+                "INSERT INTO active_proxies (proxy_string, protocol) VALUES (%s, %s) ON CONFLICT (proxy_string) DO NOTHING", 
+                (proxy, args.proto)
+            )
         except Exception:
             pass
             
     conn.commit()
+    cursor.close()
     conn.close()
-    print(f"Успешно. Сохранено живых прокси: {len(working_proxies)}")
+    print(f"Успешно. Сохранено живых прокси в PostgreSQL: {len(working_proxies)}")
 
 if __name__ == "__main__":
     asyncio.run(main())
