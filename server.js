@@ -72,7 +72,7 @@ app.post('/api/check', (req, res) => {
 // =========================
 // STREAM API (FIXED)
 // =========================
-const { spawn } = require('child_process');
+
 
 app.get('/api/tunnel', async (req, res) => {
     const { target_url } = req.query;
